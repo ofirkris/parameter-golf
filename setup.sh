@@ -2,13 +2,14 @@
 # =============================================================
 # Parameter Golf — RunPod Setup Script
 # Run once after spinning up a pod with 50GB Network Volume at /workspace
-# Template: CUDA 12.8.1 base (we install PyTorch nightly ourselves)
+# Template: CUDA 13.x base (we install PyTorch nightly ourselves)
 # =============================================================
 set -e
 
-echo "=== Phase 1: PyTorch nightly + CUDA 12.8 ==="
-# Install latest nightly for best torch.compile and SDPA performance
-pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 2>&1 | tail -5
+echo "=== Phase 1: PyTorch nightly + CUDA 13.0 ==="
+# Latest nightly with CUDA 13 for best torch.compile and SDPA performance
+# CUDA 13.2 is latest toolkit (March 2026), PyTorch nightly has cu130 builds
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 2>&1 | tail -5
 
 echo "=== Phase 2: Flash Attention 3 (Hopper/H100) ==="
 # FA3 gives ~2x speedup over SDPA on H100
