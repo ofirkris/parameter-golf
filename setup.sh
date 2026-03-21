@@ -2,18 +2,35 @@
 # =============================================================
 # Parameter Golf — RunPod Setup Script
 # Run once after spinning up a pod with 50GB Network Volume at /workspace
+# Template: CUDA 12.8.1 base (we install PyTorch nightly ourselves)
 # =============================================================
 set -e
 
-echo "=== Phase 1: Install dependencies ==="
+echo "=== Phase 1: PyTorch nightly + CUDA 12.8 ==="
+# Install latest nightly for best torch.compile and SDPA performance
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 2>&1 | tail -5
+
+echo "=== Phase 2: Flash Attention 3 (Hopper/H100) ==="
+# FA3 gives ~2x speedup over SDPA on H100
+# Try the Dao-AILab Hopper build first (provides flash_attn_interface)
+pip install flash-attn --no-build-isolation 2>&1 | tail -5 || true
+
+# If flash_attn_interface not available, try building from source
+python -c "from flash_attn_interface import flash_attn_func; print('FA3: OK')" 2>/dev/null || {
+    echo "FA3 not in pip package, trying source build..."
+    pip install ninja packaging 2>&1 | tail -2
+    cd /tmp
+    git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git 2>/dev/null || true
+    cd flash-attention/hopper
+    python setup.py install 2>&1 | tail -5 || echo "WARN: FA3 source build failed"
+    cd /workspace
+}
+
+echo "=== Phase 3: Other dependencies ==="
 pip install zstandard sentencepiece huggingface-hub datasets numpy tqdm 2>&1 | tail -3
 
-# Flash Attention (H100 sm_90)
-pip install flash-attn --no-build-isolation 2>&1 | tail -3 || echo "WARN: flash-attn failed, will use SDPA fallback"
-
-echo "=== Phase 2: Download data (one-time, persists on network volume) ==="
+echo "=== Phase 4: Download data (one-time, persists on network volume) ==="
 DATA_DIR=/workspace/data/datasets/fineweb10B_sp1024
-TOK_DIR=/workspace/data/tokenizers
 
 if [ -d "$DATA_DIR" ] && [ "$(ls $DATA_DIR/fineweb_train_*.bin 2>/dev/null | wc -l)" -ge 80 ]; then
     echo "Data already on network volume, skipping download"
@@ -33,28 +50,37 @@ else
     echo "Data download complete"
 fi
 
-echo "=== Phase 3: Clone our repo ==="
+echo "=== Phase 5: Clone our repo ==="
+cd /workspace
 if [ ! -d "/workspace/ours" ]; then
-    cd /workspace
     git clone https://github.com/Tap-Mobile/parameter-golf.git ours 2>/dev/null || \
     git clone https://github.com/openai/parameter-golf.git ours
+else
+    cd /workspace/ours && git pull && cd /workspace
 fi
+mkdir -p /workspace/ours/logs
 
-echo "=== Phase 4: Verify ==="
+echo "=== Phase 6: Verify full stack ==="
 python -c "
 import torch, sentencepiece, zstandard, numpy
-print(f'torch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')
-print(f'GPUs: {torch.cuda.device_count()}x {torch.cuda.get_device_name(0)}')
+print(f'PyTorch:  {torch.__version__}')
+print(f'CUDA:     {torch.version.cuda}')
+print(f'GPUs:     {torch.cuda.device_count()}x {torch.cuda.get_device_name(0)}')
+print(f'compile:  {hasattr(torch, \"compile\")}')
+
+fa = 'NONE (SDPA fallback)'
 try:
     from flash_attn_interface import flash_attn_func
-    print('flash_attn_3 (FA3): OK')
+    fa = 'FA3 (flash_attn_interface) — BEST'
 except:
     try:
         from flash_attn import flash_attn_func
         import flash_attn
-        print(f'flash_attn_2: OK (v{flash_attn.__version__})')
+        fa = f'FA2 (v{flash_attn.__version__})'
     except:
-        print('flash_attn: NOT AVAILABLE (using SDPA fallback)')
+        pass
+print(f'FlashAttn: {fa}')
+print(f'bf16:     {torch.cuda.is_bf16_supported()}')
 "
 
 echo ""
@@ -62,4 +88,7 @@ echo "=== Setup complete ==="
 echo "Train shards: $(ls /workspace/data/datasets/fineweb10B_sp1024/fineweb_train_*.bin | wc -l)"
 echo "Val shards:   $(ls /workspace/data/datasets/fineweb10B_sp1024/fineweb_val_*.bin | wc -l)"
 echo ""
-echo "Next: run ./run.sh (1xH100 test) or ./run8x.sh (8xH100 full)"
+echo "Next steps:"
+echo "  Quick test:  bash /workspace/ours/run.sh"
+echo "  Full run:    bash /workspace/ours/run8x.sh"
+echo "  3-seed:      bash /workspace/ours/run3seeds.sh"
