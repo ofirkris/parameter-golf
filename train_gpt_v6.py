@@ -64,7 +64,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))  # PR #398: 3000 (was 3500)
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -104,7 +104,7 @@ class Hyperparameters:
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 50))  # tight SWA: every 50 steps
-    swa_scale_threshold = float(os.environ.get("SWA_SCALE_THRESHOLD", 0.2))  # collect from last 20% of warmdown (PR #401)
+    swa_scale_threshold = float(os.environ.get("SWA_SCALE_THRESHOLD", 0.4))  # tight: last 40% of warmdown
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -113,19 +113,19 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))  # disabled: counterproductive with aggressive TTT (PR #398)
+    late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
     # TTT (Two-Phase Test-Time Training)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.008))  # PR #398: higher LR for aggressive TTT
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 20))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.005))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 10))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     # Phase 1: norm-only recalibration
     ttt_phase1_epochs = int(os.environ.get("TTT_PHASE1_EPOCHS", 50))
     ttt_phase1_lr = float(os.environ.get("TTT_PHASE1_LR", 0.01))
-    # Phase 2: aggressive block adaptation — unfreeze ALL blocks (PR #398 finding)
-    ttt_phase2_unfreeze_blocks = int(os.environ.get("TTT_PHASE2_UNFREEZE_BLOCKS", 0))  # 0 = all blocks
+    # Phase 2: selective block adaptation (last N blocks)
+    ttt_phase2_unfreeze_blocks = int(os.environ.get("TTT_PHASE2_UNFREEZE_BLOCKS", 3))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
@@ -557,19 +557,14 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
 
-    def __init__(self, *args, qat_clip_range: int = 31, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._qat_clip_range = qat_clip_range  # 15 for int5 (MLP), 31 for int6 (attn)
-
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            cr = self._qat_clip_range
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
-                scale = (row_max / cr).clamp_min(1.0 / cr)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -(cr + 1), cr) * scale[:, None]).to(x.dtype)
+                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -764,12 +759,12 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = int(mlp_mult * dim)
-        self.fc = CastedLinear(dim, hidden, bias=False, qat_clip_range=15)   # int5
-        self.proj = CastedLinear(hidden, dim, bias=False, qat_clip_range=15)  # int5
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+        x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -1205,45 +1200,37 @@ def ttt_adapt(args, base_model, device, val_tokens, rank=0, world_size=1, log_fn
     t0 = time.perf_counter()
 
     # Phase 1: Norm-only recalibration — train only scalar/norm params
-    if args.ttt_phase1_epochs > 0:
-        for p in base_model.parameters():
-            p.requires_grad_(False)
-        norm_params = []
-        for name, p in base_model.named_parameters():
-            if p.ndim <= 1:  # scalars, norms, biases, gains
-                p.requires_grad_(True)
-                norm_params.append(p)
-        if log_fn:
-            log_fn(f"ttt_phase1:start params={sum(p.numel() for p in norm_params)} lr={args.ttt_phase1_lr} epochs={args.ttt_phase1_epochs}")
-        optimizer1 = torch.optim.Adam(norm_params, lr=args.ttt_phase1_lr)
-        _ttt_run_epochs(base_model, norm_params, optimizer1, device, val_tokens, seq_len,
-                        batch_seqs, args.ttt_phase1_epochs, rank, world_size, log_fn, "phase1", t0)
+    for p in base_model.parameters():
+        p.requires_grad_(False)
+    norm_params = []
+    for name, p in base_model.named_parameters():
+        if p.ndim <= 1:  # scalars, norms, biases, gains
+            p.requires_grad_(True)
+            norm_params.append(p)
+    if log_fn:
+        log_fn(f"ttt_phase1:start params={sum(p.numel() for p in norm_params)} lr=0.01 epochs={args.ttt_phase1_epochs}")
+    optimizer1 = torch.optim.Adam(norm_params, lr=args.ttt_phase1_lr)
+    _ttt_run_epochs(base_model, norm_params, optimizer1, device, val_tokens, seq_len,
+                    batch_seqs, args.ttt_phase1_epochs, rank, world_size, log_fn, "phase1", t0)
 
-    # Phase 2: Block adaptation — unfreeze_blocks=0 means ALL blocks (PR #398 aggressive approach)
+    # Phase 2: Selective-freeze block adaptation — unfreeze last N blocks + norms
     for p in base_model.parameters():
         p.requires_grad_(False)
     phase2_params = []
     num_blocks = len(base_model.blocks)
-    unfreeze_n = args.ttt_phase2_unfreeze_blocks
-    if unfreeze_n <= 0:
-        # Unfreeze ALL model parameters (aggressive TTT, PR #398)
-        for p in base_model.parameters():
-            p.requires_grad_(True)
-            phase2_params.append(p)
-    else:
-        for i, block in enumerate(base_model.blocks):
-            if i >= num_blocks - unfreeze_n:
-                for p in block.parameters():
-                    p.requires_grad_(True)
-                    phase2_params.append(p)
-        # Also keep norm params trainable
-        for name, p in base_model.named_parameters():
-            if p.ndim <= 1 and not p.requires_grad:
+    for i, block in enumerate(base_model.blocks):
+        if i >= num_blocks - args.ttt_phase2_unfreeze_blocks:
+            for p in block.parameters():
                 p.requires_grad_(True)
                 phase2_params.append(p)
+    # Also keep norm params trainable
+    for name, p in base_model.named_parameters():
+        if p.ndim <= 1 and not p.requires_grad:
+            p.requires_grad_(True)
+            phase2_params.append(p)
     if log_fn:
-        log_fn(f"ttt_phase2:start params={sum(p.numel() for p in phase2_params)} lr={args.ttt_lr} epochs={args.ttt_epochs} unfreeze={'all' if unfreeze_n<=0 else f'last_{unfreeze_n}'}")
-    optimizer2 = torch.optim.SGD(phase2_params, lr=args.ttt_lr, momentum=args.ttt_momentum)  # SGD (PR #398)
+        log_fn(f"ttt_phase2:start params={sum(p.numel() for p in phase2_params)} lr={args.ttt_lr} epochs={args.ttt_epochs}")
+    optimizer2 = torch.optim.SGD(phase2_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     _ttt_run_epochs(base_model, phase2_params, optimizer2, device, val_tokens, seq_len,
                     batch_seqs, args.ttt_epochs, rank, world_size, log_fn, "phase2", t0)
 
