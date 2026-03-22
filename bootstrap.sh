@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================
-# Parameter Golf — Verda Startup Script
+# Parameter Golf - Verda Startup Script
 # Paste into "Create new Startup Script" on verda.com
 # Runs automatically on every new spot instance boot.
-# Logs to /var/log/pgolf-setup.log — tail it after SSH-ing in.
+# Logs to /var/log/pgolf-setup.log - tail it after SSH-ing in.
 # =============================================================
 
 exec > >(tee -a /var/log/pgolf-setup.log) 2>&1
@@ -52,7 +52,7 @@ pip3 install --break-system-packages -U flash-attn --no-build-isolation 2>&1 | t
   git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git 2>/dev/null
   cd flash-attention/hopper && python3 setup.py install 2>&1 | tail -5 || \
   { cd /tmp/flash-attention && pip3 install --break-system-packages . 2>&1 | tail -5; } || \
-  echo "WARN: Flash Attention failed — using SDPA fallback"
+  echo "WARN: Flash Attention failed - using SDPA fallback"
 }
 
 # ---- Training data (skip if already on volume) ----
@@ -72,10 +72,10 @@ fi
 # ---- Our code ----
 echo "=== Setting up workspace ==="
 mkdir -p "$VOL/ours/logs"
-# Private repo — will fail without auth, that's OK
+# Private repo - will fail without auth, thats OK
 git clone https://github.com/Tap-Mobile/parameter-golf.git "$VOL/ours" 2>/dev/null || \
   (cd "$VOL/ours" 2>/dev/null && git pull 2>/dev/null) || \
-  echo "Private repo needs auth — SCP train_gpt.py to $VOL/ours/ after SSH-ing in"
+  echo "Private repo needs auth - SCP train_gpt.py to $VOL/ours/ after SSH-ing in"
 
 # ---- Load data to RAM ----
 echo "=== Loading data to RAM ==="
