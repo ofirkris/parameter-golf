@@ -169,13 +169,7 @@ class Muon(torch.optim.Optimizer):
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 if wd > 0:
-                    # Cautious WD: only decay where gradient agrees with parameter
-                    mask = (p.grad is not None) and True
-                    if p.grad is not None:
-                        wd_mask = (p.grad * p.data) >= 0
-                        p.data[wd_mask] *= (1.0 - lr * wd)
-                    else:
-                        p.data.mul_(1.0 - lr * wd)
+                    p.data.mul_(1.0 - lr * wd)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
         return loss
@@ -287,7 +281,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,backout_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -584,7 +578,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+        x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -696,9 +690,6 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
-        # Backout: subtract mid-layer residual before logit head (nanochat)
-        self.backout_lambda = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
-        self.mid_layer = num_layers // 2
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -722,22 +713,14 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        x_mid = None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-            if i == self.mid_layer:
-                x_mid = x
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            layer_idx = self.num_encoder_layers + i
-            x = self.blocks[layer_idx](x, x0)
-            if x_mid is None and layer_idx == self.mid_layer:
-                x_mid = x
-        if x_mid is not None:
-            x = x - self.backout_lambda.to(dtype=x.dtype) * x_mid
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -756,22 +739,14 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        x_mid = None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-            if i == self.mid_layer:
-                x_mid = x
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            layer_idx = self.num_encoder_layers + i
-            x = self.blocks[layer_idx](x, x0)
-            if x_mid is None and layer_idx == self.mid_layer:
-                x_mid = x
-        if x_mid is not None:
-            x = x - self.backout_lambda.to(dtype=x.dtype) * x_mid
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
