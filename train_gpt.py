@@ -1222,8 +1222,8 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int5_int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Total submission size: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
@@ -1236,45 +1236,6 @@ def main() -> None:
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
     base_model.load_state_dict(deq_state, strict=True)
-
-    # TTT: adapt model on validation data before eval
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
-    ttt_lr = float(os.environ.get("TTT_LR", "0.002"))
-    ttt_freeze = int(os.environ.get("TTT_FREEZE_BLOCKS", "2"))
-    if ttt_epochs > 0:
-        log0(f"ttt:start epochs={ttt_epochs} lr={ttt_lr} freeze_blocks={ttt_freeze}")
-        t_ttt = time.perf_counter()
-        seq_len = args.train_seq_len
-        total_seqs = (val_tokens.numel() - 1) // seq_len
-        # Freeze early blocks
-        for i in range(min(ttt_freeze, len(base_model.blocks))):
-            for p in base_model.blocks[i].parameters():
-                p.requires_grad_(False)
-        ttt_params = [p for p in base_model.parameters() if p.requires_grad]
-        ttt_opt = torch.optim.SGD(ttt_params, lr=ttt_lr, momentum=0.9)
-        my_start = (total_seqs * rank) // world_size
-        my_end = (total_seqs * (rank + 1)) // world_size
-        base_model.train()
-        for epoch in range(ttt_epochs):
-            for bs in range(my_start, my_end, 32):
-                be = min(bs + 32, my_end)
-                rs, re = bs * seq_len, be * seq_len + 1
-                local = val_tokens[rs:re].to(device=device, dtype=torch.int64)
-                xb = local[:-1].reshape(-1, seq_len)
-                yb = local[1:].reshape(-1, seq_len)
-                ttt_opt.zero_grad(set_to_none=True)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = base_model(xb, yb)
-                loss.backward()
-                if distributed:
-                    for p in ttt_params:
-                        if p.grad is not None:
-                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
-                ttt_opt.step()
-        for p in base_model.parameters():
-            p.requires_grad_(True)
-        log0(f"ttt:done elapsed={time.perf_counter()-t_ttt:.1f}s")
 
     # Sliding window eval on int6-roundtripped weights
     torch.cuda.synchronize()
@@ -1289,15 +1250,15 @@ def main() -> None:
     else:
         log0("final_eval_mode:standard")
         q_val_loss, q_val_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps,
+            args, base_model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
@@ -1305,5 +1266,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-# fixes applied
-# tuned
