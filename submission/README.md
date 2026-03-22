@@ -1,24 +1,26 @@
-# Tap Mobile — Parameter Golf Submission
+# XSA + EMA + Partial RoPE + LN Scale
 
-## Techniques
-- 10 transformer layers, 512d, 8 heads / 4 KV heads (GQA), 3x MLP (1536 hidden)
-- Exclusive Self-Attention (XSA) on last 4 layers (arXiv:2603.09078)
-- EMA (decay=0.997) replacing SWA
-- Partial RoPE (16/64 dims) — position-free dims for generalization
-- LN Scale (1/sqrt(layer_idx+1)) — depth-dependent normalization
-- SmearGate + BigramHash(10240, dim=128)
-- U-Net skip connections
-- Orthogonal initialization, logit softcap=30
-- Muon optimizer (WD=0.04, momentum 0.99)
-- Int5 MLP / Int6 attention mixed quantization + zstd-22
-- FP16 embedding passthrough, 3% magnitude pruning
-- Sliding window evaluation (stride=64)
+## Results
+- **val_bpb: 1.1365** (seed 42, 8xH100 SXM, 600s)
+- Artifact: 15,759,319 bytes (under 16MB)
+- 6491 steps, 92ms/step
 
-## Base
-Built on thwu1's merged #1 submission (1.1428 BPB) with zero-parameter improvements from PR #315.
+## Architecture
+- 10 layers, 512d, 8/4 GQA, 3x MLP (1536), ReLU^2
+- XSA on last 4 layers, EMA 0.997, Partial RoPE 16/64, LN Scale
+- SmearGate + BigramHash(10240, 128), U-Net skips, softcap=30
 
 ## Training
-- 8xH100 SXM, ~600s wallclock
-- PyTorch 2.7.0 + FlashAttention 2.8.3
-- Batch tokens: 786,432
-- Sequence length: 2048
+- BF16 mixed precision on 8xH100 SXM
+- Muon (WD=0.04, momentum=0.99) + AdamW
+- 786K batch tokens, seq 2048, warmdown 3000
+- Optional FP8 via FP8_ENABLED=1 (experimental, ~13% faster but uses torch._scaled_mm)
+
+## Quantization
+- Int5 MLP / Int6 attention per-row, FP16 embeds, 3.2% pruning, zstd-22
+
+## Eval
+- Sliding window stride=64, scores all tokens including final partial window
+
+## Environment
+- PyTorch 2.7.0+cu128, FlashAttention 2.8.3, 8xH100 SXM 80GB

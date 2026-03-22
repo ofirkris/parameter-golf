@@ -452,7 +452,7 @@ class DistributedTokenLoader:
 # FP8 TRAINING (from nanochat — tensorwise dynamic scaling)
 # -----------------------------
 
-FP8_ENABLED = bool(int(os.environ.get("FP8_ENABLED", "1")))
+FP8_ENABLED = bool(int(os.environ.get("FP8_ENABLED", "0")))
 _FP8_EPS = 1e-12
 
 @torch.no_grad()
