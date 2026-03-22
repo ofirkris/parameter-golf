@@ -8,19 +8,31 @@
 set -e
 
 # Auto-detect volume mount — check common locations
-if [ -d "/mnt/vol" ]; then
+if mountpoint -q /mnt/vol 2>/dev/null; then
     VOL="/mnt/vol"
-elif [ -d "/workspace" ]; then
+elif mountpoint -q /workspace 2>/dev/null; then
     VOL="/workspace"
-elif [ -b "/dev/vdb" ]; then
-    echo "=== Mounting block volume ==="
-    mkdir -p /mnt/vol
-    blkid /dev/vdb >/dev/null 2>&1 || mkfs.ext4 /dev/vdb
-    mount /dev/vdb /mnt/vol
-    VOL="/mnt/vol"
 else
-    echo "WARN: No volume found, using /root/pgolf (NOT persistent!)"
-    VOL="/root/pgolf"
+    # Try to find and mount an unformatted block device (vdb, vdc, sdb, etc.)
+    FOUND_DEV=""
+    for dev in /dev/vdb /dev/vdc /dev/sdb /dev/sdc /dev/nvme1n1; do
+        if [ -b "$dev" ] && ! mount | grep -q "$dev"; then
+            FOUND_DEV="$dev"
+            break
+        fi
+    done
+    if [ -n "$FOUND_DEV" ]; then
+        echo "=== Mounting block volume $FOUND_DEV ==="
+        mkdir -p /mnt/vol
+        blkid "$FOUND_DEV" >/dev/null 2>&1 || mkfs.ext4 "$FOUND_DEV"
+        mount "$FOUND_DEV" /mnt/vol
+        VOL="/mnt/vol"
+    elif [ -d "/workspace" ]; then
+        VOL="/workspace"
+    else
+        echo "WARN: No volume found, using /root/pgolf (NOT persistent!)"
+        VOL="/root/pgolf"
+    fi
 fi
 mkdir -p "$VOL"
 echo "Volume: $VOL ($(df -h $VOL | tail -1 | awk '{print $4}') free)"
@@ -31,37 +43,38 @@ if ! command -v pip3 &>/dev/null; then
     apt-get update -qq && apt-get install -y -qq python3-pip python3-venv git 2>&1 | tail -3
 fi
 
-# ---- Phase 2: PyTorch nightly ----
-echo "=== Phase 2: PyTorch ==="
-if python3 -c "import torch" 2>/dev/null; then
-    echo "PyTorch already installed: $(python3 -c 'import torch; print(torch.__version__)')"
-else
-    # Try cu130 first, fall back to cu128
-    pip3 install --break-system-packages --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 2>&1 | tail -3 || \
-    pip3 install --break-system-packages --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 2>&1 | tail -3
-fi
+# ---- Phase 2: PyTorch nightly (always upgrade to latest) ----
+echo "=== Phase 2: PyTorch nightly ==="
+pip3 install --break-system-packages --pre --upgrade torch --index-url https://download.pytorch.org/whl/nightly/cu130 2>&1 | tail -3 || \
+pip3 install --break-system-packages --pre --upgrade torch --index-url https://download.pytorch.org/whl/nightly/cu128 2>&1 | tail -3
+echo "PyTorch: $(python3 -c 'import torch; print(torch.__version__)')"
 
 # ---- Phase 3: Python deps ----
 echo "=== Phase 3: Dependencies ==="
 pip3 install --break-system-packages -q zstandard sentencepiece huggingface-hub datasets numpy tqdm 2>&1 | tail -3
 
-# ---- Phase 4: Flash Attention ----
+# ---- Phase 4: Flash Attention (always try latest) ----
 echo "=== Phase 4: Flash Attention ==="
-if python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; then
-    echo "FA3 already installed"
-elif python3 -c "from flash_attn import flash_attn_func" 2>/dev/null; then
-    echo "FA2 already installed"
-else
-    pip3 install --break-system-packages flash-attn --no-build-isolation 2>&1 | tail -5 || {
-        echo "pip flash-attn failed, trying source build..."
-        pip3 install --break-system-packages ninja packaging 2>&1 | tail -2
-        cd /tmp
-        [ -d flash-attention ] || git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git
-        cd flash-attention/hopper && python3 setup.py install 2>&1 | tail -5 || echo "FA3 source failed"
-        cd /tmp/flash-attention && pip3 install --break-system-packages . 2>&1 | tail -5 || echo "FA2 also failed — using SDPA"
-        cd "$VOL"
-    }
-fi
+pip3 install --break-system-packages --upgrade flash-attn --no-build-isolation 2>&1 | tail -5 || {
+    echo "pip flash-attn failed, trying FA3 source build..."
+    pip3 install --break-system-packages ninja packaging 2>&1 | tail -2
+    cd /tmp
+    rm -rf flash-attention
+    git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git
+    cd flash-attention/hopper && python3 setup.py install 2>&1 | tail -5 || echo "FA3 source failed"
+    cd /tmp/flash-attention && pip3 install --break-system-packages . 2>&1 | tail -5 || echo "FA2 also failed — using SDPA"
+    cd "$VOL"
+}
+python3 -c "
+fa = 'NONE (SDPA fallback)'
+try:
+    from flash_attn_interface import flash_attn_func; fa = 'FA3'
+except:
+    try:
+        from flash_attn import flash_attn_func; import flash_attn; fa = f'FA2 v{flash_attn.__version__}'
+    except: pass
+print(f'FlashAttn: {fa}')
+"
 
 # ---- Phase 5: Data (persistent on volume) ----
 echo "=== Phase 5: Training data ==="
