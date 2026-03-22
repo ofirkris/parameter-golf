@@ -58,7 +58,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -86,7 +86,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
@@ -287,7 +287,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 FP16_KEEP_NAME_PATTERNS = tuple(
     pattern
-    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.8.attn.c_k").split(",")
+    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.9.attn.c_k").split(",")
     if pattern
 )
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
@@ -1283,24 +1283,67 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # Magnitude pruning: zero out smallest weights to improve compression
+    # Binary search: find minimum pruning that fits artifact under 16MB
+    MAX_ARTIFACT = 16_000_000
+    code_bytes = len(code.encode("utf-8"))
+    max_model_bytes = MAX_ARTIFACT - code_bytes
+    saved_sd = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+
+    def try_prune_and_compress(prune_frac):
+        # Restore original weights
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                param.copy_(saved_sd[name].to(param.device))
+        # Apply pruning
+        if prune_frac > 0:
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    if param.ndim == 2 and param.numel() > 65536:
+                        threshold = torch.quantile(param.abs().float().flatten(), prune_frac)
+                        param.masked_fill_(param.abs() < threshold, 0.0)
+        # Quantize + compress
+        sd = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+        qr, qm = mixed_quantize_int6(sd, {"mlp", "attn", "bigram"})
+        buf = io.BytesIO()
+        torch.save({"w": qr, "m": qm}, buf)
+        raw = buf.getvalue()
+        blob = zstandard.ZstdCompressor(level=22).compress(raw) if _COMPRESSOR == "zstd" else zlib.compress(raw, 9)
+        return len(blob), blob, qr, qm
+
+    # Binary search for minimum pruning
+    lo, hi = 0.0, 0.15
+    best_blob = best_qr = best_qm = None
+    best_frac = hi
+    for _ in range(12):  # 12 iterations = precision ~0.00004
+        mid = (lo + hi) / 2
+        sz, blob, qr, qm = try_prune_and_compress(mid)
+        log0(f"prune_search: frac={mid:.4f} model_bytes={sz} total={sz + code_bytes} {'FITS' if sz <= max_model_bytes else 'OVER'}")
+        if sz <= max_model_bytes:
+            hi = mid
+            best_blob, best_qr, best_qm, best_frac = blob, qr, qm, mid
+        else:
+            lo = mid
+
+    # If even 0% fits, use that
+    if best_blob is None:
+        sz, best_blob, best_qr, best_qm = try_prune_and_compress(0.0)
+        best_frac = 0.0
+        if sz > max_model_bytes:
+            log0(f"WARNING: model too large even at 0% pruning: {sz + code_bytes} bytes")
+
+    log0(f"prune_search:done best_frac={best_frac:.4f} artifact={len(best_blob) + code_bytes}")
+
+    # Apply the winning pruning and save
     with torch.no_grad():
         for name, param in base_model.named_parameters():
-            if param.ndim == 2 and param.numel() > 65536:
-                threshold = torch.quantile(param.abs().float().flatten(), 0.032)
-                mask = param.abs() < threshold
-                param.masked_fill_(mask, 0.0)
-
-    # INT6 mixed quantization + zstd/zlib export
-    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"})
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
-    else:
-        quant_blob = zlib.compress(quant_raw, 9)
+            param.copy_(saved_sd[name].to(param.device))
+        if best_frac > 0:
+            for name, param in base_model.named_parameters():
+                if param.ndim == 2 and param.numel() > 65536:
+                    threshold = torch.quantile(param.abs().float().flatten(), best_frac)
+                    param.masked_fill_(param.abs() < threshold, 0.0)
+    quant_blob = best_blob
+    quant_result, quant_meta = best_qr, best_qm
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1318,7 +1361,8 @@ def main() -> None:
     else:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+    final_sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], final_sd_cpu)
     base_model.load_state_dict(deq_state, strict=True)
 
     # Sliding window eval on int6-roundtripped weights
