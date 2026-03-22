@@ -33,10 +33,10 @@ echo "=== Installing system packages ==="
 apt-get update -qq
 apt-get install -y -qq python3-pip python3-venv git screen 2>&1 | tail -3
 
-# ---- PyTorch nightly ----
-echo "=== Installing PyTorch nightly ==="
-pip3 install --break-system-packages --pre -U torch --index-url https://download.pytorch.org/whl/nightly/cu130 2>&1 | tail -5 || \
-pip3 install --break-system-packages --pre -U torch --index-url https://download.pytorch.org/whl/nightly/cu128 2>&1 | tail -5 || \
+# ---- PyTorch stable (working torch.compile + flash-attn compat) ----
+echo "=== Installing PyTorch ==="
+pip3 install --break-system-packages -U torch --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5 || \
+pip3 install --break-system-packages -U torch --index-url https://download.pytorch.org/whl/cu126 2>&1 | tail -5 || \
 echo "WARN: PyTorch install failed"
 
 # ---- Python deps ----
