@@ -426,46 +426,27 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-class TokenStream:
-    def __init__(self, pattern: str):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files:
-            raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
-        self.pos = 0
-
-    def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        self.pos = 0
-
-    def take(self, n: int) -> Tensor:
-        chunks: list[Tensor] = []
-        remaining = n
-        while remaining > 0:
-            avail = self.tokens.numel() - self.pos
-            if avail <= 0:
-                self._advance_file()
-                continue
-            k = min(remaining, avail)
-            chunks.append(self.tokens[self.pos : self.pos + k])
-            self.pos += k
-            remaining -= k
-        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-
 class DistributedTokenLoader:
+    """Pre-loads ALL shards into pinned CPU memory for zero-stall GPU transfers."""
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not files:
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        all_shards = [load_data_shard(f) for f in files]
+        self.tokens = torch.cat(all_shards).pin_memory()
+        self.pos = 0
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
+        total_span = per_rank_span * self.world_size
+        if self.pos + total_span > self.tokens.numel():
+            self.pos = 0
+        chunk = self.tokens[self.pos : self.pos + total_span]
+        self.pos += total_span
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
@@ -1247,7 +1228,7 @@ def main() -> None:
     with torch.no_grad():
         for name, param in base_model.named_parameters():
             if param.ndim == 2 and param.numel() > 65536:
-                threshold = torch.quantile(param.abs().float().flatten(), 0.05)
+                threshold = torch.quantile(param.abs().float().flatten(), 0.032)
                 mask = param.abs() < threshold
                 param.masked_fill_(mask, 0.0)
 
