@@ -103,8 +103,7 @@ class Hyperparameters:
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
-    swa_every = int(os.environ.get("SWA_EVERY", 50))  # tight SWA: every 50 steps
-    swa_scale_threshold = float(os.environ.get("SWA_SCALE_THRESHOLD", 0.4))  # tight: last 40% of warmdown
+    swa_every = int(os.environ.get("SWA_EVERY", 200))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -1596,7 +1595,7 @@ def main() -> None:
                 for name, t in base_model.state_dict().items():
                     ema_state[name].mul_(d).add_(t.detach().float(), alpha=1.0 - d)
 
-        if args.swa_enabled and not args.ema_enabled and scale < args.swa_scale_threshold and step % args.swa_every == 0:
+        if args.swa_enabled and not args.ema_enabled and scale < 0.5 and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
