@@ -13,4 +13,5 @@ ITERATIONS=500 \
 VAL_LOSS_EVERY=100 \
 TRAIN_LOG_EVERY=25 \
 EVAL_STRIDE=64 \
+TTT_EPOCHS=0 \
 python3 train_gpt.py 2>&1 | tee logs/test_1gpu.log
