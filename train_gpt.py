@@ -103,7 +103,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "8,9")
     late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
     qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.15))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 100))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
 
@@ -546,13 +546,12 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-class CastedLinear(nn.Linear):
-    _qat_enabled: bool = False
-    _qat_threshold: float = 0.15
+_QAT_ACTIVE = [False]  # mutable list avoids torch.compile constant folding
 
+class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+        if _QAT_ACTIVE[0] and self.training and w.ndim == 2:
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
@@ -837,17 +836,18 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
-    def _get_ve(self, layer_idx: int, input_ids: Tensor) -> Tensor | None:
-        if self.ve is None or layer_idx not in self.ve_layer_indices:
+    def _get_ve(self, layer_idx: int, ve_base: Tensor | None) -> Tensor | None:
+        if ve_base is None or layer_idx not in self.ve_layer_indices:
             return None
         ve_idx = self.ve_layer_indices.index(layer_idx)
-        return self.ve(input_ids) * self.ve_scales[ve_idx].to(dtype=self.ve(input_ids).dtype)
+        return ve_base * self.ve_scales[ve_idx].to(dtype=ve_base.dtype)
 
     def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor) -> Tensor:
         v0 = None
+        ve_base = self.ve(input_ids) if self.ve is not None else None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids)
+            ve = self._get_ve(i, ve_base)
             x, raw_v = self.blocks[i](x, x0, v0=v0, v_embed=ve)
             if v0 is None and self.value_residual:
                 v0 = raw_v
@@ -856,7 +856,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             layer_idx = self.num_encoder_layers + i
-            ve = self._get_ve(layer_idx, input_ids)
+            ve = self._get_ve(layer_idx, ve_base)
             x, raw_v = self.blocks[layer_idx](x, x0, v0=v0, v_embed=ve)
             if v0 is None and self.value_residual:
                 v0 = raw_v
@@ -1064,8 +1064,7 @@ def main() -> None:
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # MODEL + OPTIMIZER SETUP
-    CastedLinear._qat_enabled = False
-    CastedLinear._qat_threshold = args.qat_threshold
+    _QAT_ACTIVE[0] = False
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1265,8 +1264,8 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if args.late_qat and scale < args.qat_threshold and not CastedLinear._qat_enabled:
-            CastedLinear._qat_enabled = True
+        if args.late_qat and scale < args.qat_threshold and not _QAT_ACTIVE[0]:
+            _QAT_ACTIVE[0] = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1418,12 +1417,12 @@ def main() -> None:
         else:
             lo = mid
 
-    # If no tested fraction fits, use the maximum (0.15) as last resort
+    # If no tested fraction fits, use maximum and fail hard
     if best_blob is None:
         sz, best_blob, best_qr, best_qm = try_prune_and_compress(0.15)
         best_frac = 0.15
         if sz > max_model_bytes:
-            log0(f"WARNING: model too large even at 15% pruning: {sz + code_bytes} bytes")
+            raise RuntimeError(f"ARTIFACT TOO LARGE: {sz + code_bytes} bytes even at 15% pruning (limit {MAX_ARTIFACT})")
 
     log0(f"prune_search:done best_frac={best_frac:.4f} artifact={len(best_blob) + code_bytes}")
 
