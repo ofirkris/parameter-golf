@@ -290,7 +290,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,vr_lambda,ve_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,vr_lambda,ve_scale,dwa_weights",
     ).split(",")
     if pattern
 )
@@ -794,6 +794,19 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.use_dwa = bool(int(os.environ.get("USE_DWA", "1")))
+        if self.use_dwa:
+            # DenseFormer DWA: each layer output is weighted avg of all previous outputs
+            # dwa_weights[i] has i+1 entries (weights for layers 0..i)
+            self.dwa_weights = nn.ParameterList([
+                nn.Parameter(torch.zeros(i + 2, dtype=torch.float32))  # +1 for input x0
+                for i in range(num_layers)
+            ])
+            # Initialize: last weight = 1.0 (identity), rest = 0.0
+            for i, w in enumerate(self.dwa_weights):
+                w.data[-1] = 1.0
+        else:
+            self.dwa_weights = None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -845,21 +858,37 @@ class GPT(nn.Module):
     def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor) -> Tensor:
         v0 = None
         ve_base = self.ve(input_ids) if self.ve is not None else None
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, ve_base)
-            x, raw_v = self.blocks[i](x, x0, v0=v0, v_embed=ve)
-            if v0 is None and self.value_residual:
-                v0 = raw_v
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            layer_idx = self.num_encoder_layers + i
-            ve = self._get_ve(layer_idx, ve_base)
-            x, raw_v = self.blocks[layer_idx](x, x0, v0=v0, v_embed=ve)
-            if v0 is None and self.value_residual:
-                v0 = raw_v
+        num_layers = len(self.blocks)
+
+        if self.use_dwa:
+            # DenseFormer DWA: weighted average of all previous layer outputs
+            layer_outputs: list[Tensor] = [x0]  # include initial embedding as layer "0"
+            for i in range(num_layers):
+                # Weighted sum of all previous outputs
+                w = torch.softmax(self.dwa_weights[i].to(dtype=x.dtype), dim=0)
+                x = sum(w[j] * layer_outputs[j] for j in range(len(layer_outputs)))
+                ve = self._get_ve(i, ve_base)
+                x, raw_v = self.blocks[i](x, x0, v0=v0, v_embed=ve)
+                if v0 is None and self.value_residual:
+                    v0 = raw_v
+                layer_outputs.append(x)
+        else:
+            # U-Net skip connections
+            skips: list[Tensor] = []
+            for i in range(self.num_encoder_layers):
+                ve = self._get_ve(i, ve_base)
+                x, raw_v = self.blocks[i](x, x0, v0=v0, v_embed=ve)
+                if v0 is None and self.value_residual:
+                    v0 = raw_v
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                layer_idx = self.num_encoder_layers + i
+                ve = self._get_ve(layer_idx, ve_base)
+                x, raw_v = self.blocks[layer_idx](x, x0, v0=v0, v_embed=ve)
+                if v0 is None and self.value_residual:
+                    v0 = raw_v
         return x
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1118,6 +1147,9 @@ def main() -> None:
         if base_model.ve_scales is not None:
             for s in base_model.ve_scales:
                 scalar_params.append(s)
+    if base_model.dwa_weights is not None:
+        for w in base_model.dwa_weights:
+            scalar_params.append(w)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1478,6 +1510,10 @@ def main() -> None:
         total_steps = args.ttt_epochs * ((my_end - my_start + batch_seqs - 1) // batch_seqs)
         ttt_sched = torch.optim.lr_scheduler.CosineAnnealingLR(ttt_opt, T_max=max(total_steps, 1))
 
+        # N-gram mixer: blend neural logits with unigram counts (zero artifact cost)
+        ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.07"))
+        ngram_counts = torch.zeros(args.vocab_size, device=device, dtype=torch.float32)
+
         # Accumulators for BPB (last epoch only)
         ttt_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
         ttt_token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1497,8 +1533,16 @@ def main() -> None:
                     base_model.eval()
                     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits = base_model.forward_logits(xb)
-                    nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(),
-                                          yb.reshape(-1), reduction="none")
+                    # N-gram mixer: blend neural logprobs with unigram distribution
+                    if ngram_alpha > 0 and ngram_counts.sum() > 0:
+                        ngram_probs = (ngram_counts + 1e-8) / (ngram_counts.sum() + 1e-8 * args.vocab_size)
+                        log_ngram = ngram_probs.log().unsqueeze(0)
+                        log_neural = F.log_softmax(logits.reshape(-1, logits.size(-1)).float(), dim=-1)
+                        mixed = (1 - ngram_alpha) * log_neural + ngram_alpha * log_ngram
+                        nll = F.nll_loss(mixed, yb.reshape(-1), reduction="none")
+                    else:
+                        nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(),
+                                              yb.reshape(-1), reduction="none")
                     ttt_loss_sum += nll.sum().to(torch.float64)
                     ttt_token_count += float(yb.numel())
                     tgt = yb.reshape(-1)
@@ -1506,6 +1550,10 @@ def main() -> None:
                     prev = xb.reshape(-1)
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     ttt_byte_count += tb.sum()
+
+                # Update n-gram counts from this chunk
+                if ngram_alpha > 0:
+                    ngram_counts.scatter_add_(0, yb.reshape(-1).long(), torch.ones(yb.numel(), device=device))
 
                 # 2. Train on the scored chunk
                 base_model.train()
