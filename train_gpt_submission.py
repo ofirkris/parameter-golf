@@ -103,7 +103,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "8,9")
     late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
     qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.15))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 30))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 50))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
 
@@ -1418,12 +1418,12 @@ def main() -> None:
         else:
             lo = mid
 
-    # If even 0% fits, use that
+    # If no tested fraction fits, use the maximum (0.15) as last resort
     if best_blob is None:
-        sz, best_blob, best_qr, best_qm = try_prune_and_compress(0.0)
-        best_frac = 0.0
+        sz, best_blob, best_qr, best_qm = try_prune_and_compress(0.15)
+        best_frac = 0.15
         if sz > max_model_bytes:
-            log0(f"WARNING: model too large even at 0% pruning: {sz + code_bytes} bytes")
+            log0(f"WARNING: model too large even at 15% pruning: {sz + code_bytes} bytes")
 
     log0(f"prune_search:done best_frac={best_frac:.4f} artifact={len(best_blob) + code_bytes}")
 
@@ -1535,28 +1535,33 @@ def main() -> None:
         ttt_val_bpb = ttt_bpt * ttt_tpb
         log0(f"ttt:done epochs={args.ttt_epochs} elapsed={time.perf_counter()-t_ttt:.1f}s ttt_val_bpb={ttt_val_bpb:.6f}")
 
-    # Sliding window eval on TTT-adapted (or non-adapted) weights
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
-        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
-        q_val_loss, q_val_bpb = eval_val_sliding(
-            args, base_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
-        )
+    # Final eval: if TTT ran, its score-then-train BPB is the legal metric.
+    # Only run sliding window eval if TTT was NOT used.
+    if args.ttt_epochs > 0:
+        q_val_bpb = ttt_val_bpb
+        log0(f"final_roundtrip_exact val_bpb:{q_val_bpb:.8f} (from TTT score-then-train)")
     else:
-        log0("final_eval_mode:standard")
-        q_val_loss, q_val_bpb = eval_val(
-            args, base_model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
+            log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+            q_val_loss, q_val_bpb = eval_val_sliding(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
+            )
+        else:
+            log0("final_eval_mode:standard")
+            q_val_loss, q_val_bpb = eval_val(
+                args, base_model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            )
+        torch.cuda.synchronize()
+        log0(
+            f"final_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
         )
-    torch.cuda.synchronize()
-    log0(
-        f"final_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        log0(f"final_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
