@@ -437,7 +437,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             clip = 15 if cat == "mlp" else 31  # int5 for MLP, int6 for attention
             H = _HESSIAN_HOOKS.get(name)
             if H is not None:
-                H = H / max(_HESSIAN_NSAMPLES.get(name, 1), 1)
+                H = (H / max(_HESSIAN_NSAMPLES.get(name, 1), 1)).cpu()
             q, s = quantize_intN_gptq(t, clip_range=clip, hessian=H)
             result[name + ".q"] = q
             result[name + ".scale"] = s
