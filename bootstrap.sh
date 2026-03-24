@@ -44,8 +44,9 @@ echo "WARN: PyTorch install failed"
 echo "=== Installing Python dependencies ==="
 pip3 install --break-system-packages -q -U zstandard sentencepiece huggingface-hub datasets numpy tqdm 2>&1 | tail -3
 
-# ---- Flash Attention (FA4 built into PyTorch 2.11 SDPA, no separate install needed) ----
-echo "=== Flash Attention: built into PyTorch 2.11 SDPA ==="
+# ---- Flash Attention (install FA2 for PyTorch 2.7) ----
+echo "=== Installing Flash Attention ==="
+pip3 install --break-system-packages flash-attn --no-build-isolation 2>&1 | tail -5 || echo "FA build failed, using SDPA"
 
 # ---- Training data (skip if already on volume) ----
 echo "=== Training data ==="
