@@ -44,17 +44,8 @@ echo "WARN: PyTorch install failed"
 echo "=== Installing Python dependencies ==="
 pip3 install --break-system-packages -q -U zstandard sentencepiece huggingface-hub datasets numpy tqdm 2>&1 | tail -3
 
-# ---- Flash Attention ----
-echo "=== Installing Flash Attention ==="
-pip3 install --break-system-packages -U flash-attn --no-build-isolation 2>&1 | tail -5 || {
-  echo "FA pip failed, trying source build..."
-  pip3 install --break-system-packages ninja packaging 2>&1 | tail -2
-  cd /tmp && rm -rf flash-attention
-  git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git 2>/dev/null
-  cd flash-attention/hopper && python3 setup.py install 2>&1 | tail -5 || \
-  { cd /tmp/flash-attention && pip3 install --break-system-packages . 2>&1 | tail -5; } || \
-  echo "WARN: Flash Attention failed - using SDPA fallback"
-}
+# ---- Flash Attention (FA4 built into PyTorch 2.11 SDPA, no separate install needed) ----
+echo "=== Flash Attention: built into PyTorch 2.11 SDPA ==="
 
 # ---- Training data (skip if already on volume) ----
 echo "=== Training data ==="

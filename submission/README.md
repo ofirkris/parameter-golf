@@ -26,4 +26,4 @@ Pending 8xH100 validation run.
 - Sliding window stride=64 (non-TTT fallback)
 
 ## Environment
-- PyTorch 2.7.0+cu128, FlashAttention 2.8.3, 8xH100 SXM
+- PyTorch 2.11.0+cu130, FA4 via SDPA (built-in), 8xH100 SXM

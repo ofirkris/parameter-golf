@@ -41,6 +41,5 @@ QAT_THRESHOLD=0.15 \
 TTT_EPOCHS=150 \
 TTT_LR=0.0005 \
 TTT_BATCH_SEQS=32 \
-FP8_ENABLED=0 \
 EVAL_STRIDE=64 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py 2>&1 | tee logs/run_8gpu_seed${SEED}.log
