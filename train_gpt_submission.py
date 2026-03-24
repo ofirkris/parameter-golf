@@ -97,13 +97,13 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
+    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "8,9")
     late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
     qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.15))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 150))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
 
@@ -635,7 +635,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
