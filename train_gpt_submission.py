@@ -469,6 +469,8 @@ class DistributedTokenLoader:
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         if self._prefetched is not None:
+            # Wait for prefetch stream to complete before using the data
+            torch.cuda.current_stream(self.device).wait_stream(self._stream)
             result = self._prefetched
             self._prefetched = None
         else:
@@ -745,7 +747,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.use_dwa = bool(int(os.environ.get("USE_DWA", "1")))
+        self.use_dwa = bool(int(os.environ.get("USE_DWA", "0")))
         if self.use_dwa:
             # DenseFormer DWA: each layer output is weighted avg of all previous outputs
             # dwa_weights[i] has i+1 entries (weights for layers 0..i)
@@ -1445,7 +1447,7 @@ def main() -> None:
         ttt_sched = torch.optim.lr_scheduler.CosineAnnealingLR(ttt_opt, T_max=max(total_steps, 1))
 
         # N-gram mixer: blend neural logits with unigram counts (zero artifact cost)
-        ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.07"))
+        ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0"))
         ngram_counts = torch.zeros(args.vocab_size, device=device, dtype=torch.float32)
 
         # Accumulators for BPB (last epoch only)
