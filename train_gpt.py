@@ -490,7 +490,7 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class DistributedTokenLoader:
-    """Pre-loads ALL shards into pinned CPU memory for zero-stall GPU transfers."""
+    """Pre-loads ALL shards into pinned CPU memory. Prefetches next batch to GPU async."""
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -501,8 +501,10 @@ class DistributedTokenLoader:
         all_shards = [load_data_shard(f) for f in files]
         self.tokens = torch.cat(all_shards).pin_memory()
         self.pos = 0
+        self._stream = torch.cuda.Stream(device=device)
+        self._prefetched: tuple[Tensor, Tensor] | None = None
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def _prepare(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         total_span = per_rank_span * self.world_size
@@ -515,6 +517,17 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        if self._prefetched is not None:
+            result = self._prefetched
+            self._prefetched = None
+        else:
+            result = self._prepare(global_tokens, seq_len, grad_accum_steps)
+        # Prefetch next batch on separate stream
+        with torch.cuda.stream(self._stream):
+            self._prefetched = self._prepare(global_tokens, seq_len, grad_accum_steps)
+        return result
 
 
 # -----------------------------
