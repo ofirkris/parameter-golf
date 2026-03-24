@@ -97,13 +97,13 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
-    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
+    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "8,9")
     late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
     qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.15))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 0))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
 
@@ -345,27 +345,75 @@ def _classify_param(name: str) -> str:
         return "attn"
     return "other"
 
-def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
-    """GPTQ-lite: multi-percentile optimal clip search per row."""
+def quantize_intN_gptq(t: Tensor, clip_range: int = 31, hessian: Tensor | None = None,
+                        block_size: int = 128, percdamp: float = 0.01) -> tuple[Tensor, Tensor]:
+    """Full Hessian GPTQ: column-by-column quantization with error redistribution."""
     t32 = t.float()
-    if t32.ndim == 2:
-        best_q, best_s, best_err = None, None, float('inf')
-        for pct in [0.9999, 0.99999, 1.0]:
-            if pct < 1.0:
-                row_clip = torch.quantile(t32.abs(), pct, dim=1)
-            else:
-                row_clip = t32.abs().amax(dim=1)
-            scale = (row_clip / clip_range).clamp_min(1e-12).to(torch.float16)
-            scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
+    if t32.ndim != 2 or hessian is None:
+        # Fallback: simple per-row quantization
+        if t32.ndim == 2:
+            row_max = t32.abs().amax(dim=1)
+            scale = (row_max / clip_range).clamp_min(1e-12).to(torch.float16)
             q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -(clip_range+1), clip_range).to(torch.int8)
-            err = ((q.float() * scale.float()[:, None] - t32) ** 2).sum().item()
-            if err < best_err:
-                best_q, best_s, best_err = q, scale, err
-        return best_q, best_s
-    amax = t32.abs().max().item()
-    scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
-    return q, scale
+            return q, scale
+        amax = t32.abs().max().item()
+        scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
+        return q, scale
+
+    # Full GPTQ: Hessian-guided column-wise quantization
+    W = t32.clone()
+    nrows, ncols = W.shape
+    H = hessian.float()
+    # Damping
+    damp = percdamp * H.diag().mean()
+    H.diagonal().add_(damp)
+    # Cholesky for error redistribution
+    try:
+        L = torch.linalg.cholesky(H)
+        Hinv = torch.cholesky_inverse(L)
+    except Exception:
+        Hinv = torch.inverse(H + 1e-6 * torch.eye(ncols, device=H.device))
+
+    # Per-row scale
+    row_max = W.abs().amax(dim=1)
+    scale = (row_max / clip_range).clamp_min(1e-12).to(torch.float16)
+    scale_f = scale.float()
+
+    # Quantize in blocks
+    Q = torch.zeros_like(W, dtype=torch.int8)
+    for col_start in range(0, ncols, block_size):
+        col_end = min(col_start + block_size, ncols)
+        W_block = W[:, col_start:col_end].clone()
+        Hinv_block = Hinv[col_start:col_end, col_start:col_end]
+        Err = torch.zeros_like(W_block)
+        for j in range(col_end - col_start):
+            w_col = W_block[:, j]
+            q_col = torch.clamp(torch.round(w_col / scale_f), -(clip_range+1), clip_range)
+            Q[:, col_start + j] = q_col.to(torch.int8)
+            err = (w_col - q_col * scale_f)
+            if j + 1 < col_end - col_start:
+                hinv_jj = Hinv_block[j, j].clamp_min(1e-12)
+                W_block[:, j+1:] -= err.unsqueeze(1) * (Hinv_block[j, j+1:] / hinv_jj).unsqueeze(0)
+    return Q, scale
+
+
+# Hessian collection hooks for Full GPTQ
+_HESSIAN_HOOKS: dict[str, Tensor] = {}
+_HESSIAN_NSAMPLES: dict[str, int] = {}
+
+def _hessian_hook(name: str):
+    def hook(module, input, output):
+        x = input[0].detach().float()
+        if x.ndim == 3:
+            x = x.reshape(-1, x.size(-1))
+        H = x.T @ x
+        if name in _HESSIAN_HOOKS:
+            _HESSIAN_HOOKS[name] += H
+        else:
+            _HESSIAN_HOOKS[name] = H
+        _HESSIAN_NSAMPLES[name] = _HESSIAN_NSAMPLES.get(name, 0) + x.size(0)
+    return hook
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     result: dict[str, Tensor] = {}
@@ -387,7 +435,10 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             continue
         if cat in int6_cats and t.ndim >= 1:
             clip = 15 if cat == "mlp" else 31  # int5 for MLP, int6 for attention
-            q, s = quantize_intN_per_row(t, clip_range=clip)
+            H = _HESSIAN_HOOKS.get(name)
+            if H is not None:
+                H = H / max(_HESSIAN_NSAMPLES.get(name, 1), 1)
+            q, s = quantize_intN_gptq(t, clip_range=clip, hessian=H)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": f"int{5 if cat == 'mlp' else 6}"}
@@ -1319,6 +1370,25 @@ def main() -> None:
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
+
+    # Collect Hessians for Full GPTQ (256 calibration samples from training data)
+    log0("gptq:collecting Hessians for calibration...")
+    _HESSIAN_HOOKS.clear()
+    _HESSIAN_NSAMPLES.clear()
+    hooks = []
+    for name, module in base_model.named_modules():
+        if isinstance(module, CastedLinear) and module.weight.ndim == 2:
+            hooks.append(module.register_forward_hook(_hessian_hook(name + ".weight")))
+    base_model.eval()
+    calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        n_calib = min(256, args.train_batch_tokens // args.train_seq_len)
+        for _ in range(max(1, n_calib)):
+            cx, cy = calib_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            base_model.forward_logits(cx)
+    for h in hooks:
+        h.remove()
+    log0(f"gptq:collected Hessians for {len(_HESSIAN_HOOKS)} layers")
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
     if master_process:
