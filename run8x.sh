@@ -42,6 +42,6 @@ TTT_EPOCHS=30 \
 TTT_LR=0.0005 \
 TTT_BATCH_SEQS=32 \
 USE_DWA=0 \
-USE_MIXER=1 \
+NGRAM_CACHE=1 \
 EVAL_STRIDE=64 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py 2>&1 | tee logs/run_8gpu_seed${SEED}.log

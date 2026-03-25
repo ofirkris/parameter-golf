@@ -21,7 +21,7 @@ Pending 8xH100 validation run.
 ## Eval
 - 30 epoch legal sequential score-then-train TTT
 - AdamW lr=0.0005, cosine LR, per-layer scaling (mlp.proj 3x, mlp.fc 0.5x)
-- 5-expert Hedge Mixer: neural + unigram + bigram + trigram + entropy
+- Multi-order N-gram Backoff (orders 2-7) with entropy-adaptive alpha
 - Sliding window stride=64 (non-TTT fallback)
 
 ## Environment

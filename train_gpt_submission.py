@@ -38,73 +38,86 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 
 # -----------------------------
-# HEDGE MIXER (from PR #688 — 5-expert online context mixing)
+# N-GRAM BACKOFF CACHE (from PR #727 — multi-order backoff + entropy-adaptive alpha)
+# Worth ~0.16 BPP improvement over neural-only (1.1271 -> 0.9674)
 # -----------------------------
 
-class LogisticContextMixer:
-    def __init__(self, vocab_size: int = 1024, device: str = 'cuda', eta: float = 0.1):
+class NgramBackoffCache:
+    """Multi-order (2-7) n-gram cache with backoff and entropy-adaptive alpha.
+    All CPU/numpy for hash table efficiency. Integrated in eval_val_sliding."""
+
+    def __init__(self, vocab_size: int = 1024, max_order: int = 7, min_order: int = 2,
+                 buckets: int = 4194304, min_count: int = 2,
+                 ent_base: float = 0.05, ent_range: float = 0.55,
+                 ent_scale: float = 2.0, ent_thresh: float = 4.0):
         self.V = vocab_size
-        self.device = device
-        self.eta = eta
-        self.K = 5
-        self.log_weights = torch.zeros(self.K, device=device)
-        self.log_weights[0] = 2.0  # bias toward neural
-        self.uni_counts = torch.zeros(vocab_size, device=device)
-        self.bi_counts = torch.zeros(vocab_size, vocab_size, device=device)
-        self.total_tokens = 0
-        self.TRI_HASH = 65536
-        self.tri_counts = torch.zeros(self.TRI_HASH, vocab_size, device=device)
-        self.tri_row_totals = torch.zeros(self.TRI_HASH, device=device)
+        self.max_order = max_order
+        self.min_order = min_order
+        self.n_orders = max_order - min_order + 1
+        self.buckets = buckets
+        self.min_count = min_count
+        self.ent_base = ent_base
+        self.ent_range = ent_range
+        self.ent_scale = ent_scale
+        self.ent_thresh = ent_thresh
+        self.mask = np.uint64(buckets - 1)
+        self.primes = np.array([36313, 27191, 51647, 81929, 131071, 175447, 209591], dtype=np.uint64)
+        # ctx_tables[o]: context hash -> count (how many times this context was seen)
+        self.ctx_tables = [np.zeros(buckets, dtype=np.uint32) for _ in range(self.n_orders)]
+        # full_tables[o]: hash(context, next_token) -> count
+        self.full_tables = [np.zeros(buckets, dtype=np.uint32) for _ in range(self.n_orders)]
 
-    def update(self, tokens):
-        t = tokens.to(self.device).long() if hasattr(tokens, 'cpu') else torch.tensor(tokens, device=self.device, dtype=torch.long)
-        n = t.numel()
-        if n == 0: return
-        self.total_tokens += n
-        self.uni_counts.scatter_add_(0, t, torch.ones(n, device=self.device))
-        if n >= 2:
-            bi_idx = t[:-1] * self.V + t[1:]
-            self.bi_counts.reshape(-1).scatter_add_(0, bi_idx, torch.ones(n - 1, device=self.device))
-        if n >= 3:
-            tri_ctx = ((t[:-2] * 36313) ^ (t[1:-1] * 27191)) % self.TRI_HASH
-            tri_idx = tri_ctx * self.V + t[2:]
-            ones_tri = torch.ones(n - 2, device=self.device)
-            self.tri_counts.reshape(-1).scatter_add_(0, tri_idx, ones_tri)
-            self.tri_row_totals.scatter_add_(0, tri_ctx, ones_tri)
+    def _hash_context(self, tokens, order):
+        """Hash the last `order-1` tokens into a bucket index."""
+        h = np.uint64(0)
+        for i, t in enumerate(tokens[-(order-1):]):
+            h = (h ^ (np.uint64(t) * self.primes[i])) & self.mask
+        return int(h)
 
-    def mix_and_score(self, neural_logits, x_batch, y_batch, wlens):
-        bsz, slen, V = neural_logits.shape
-        uniform_nll = math.log(self.V)
-        if self.total_tokens < 10000:
-            nll = F.cross_entropy(neural_logits.reshape(-1, V), y_batch.reshape(-1), reduction="none").reshape(bsz, slen)
-            return nll, None
-        neural_lp = F.log_softmax(neural_logits, dim=-1)
-        neural_nll = -neural_lp.gather(2, y_batch.unsqueeze(2)).squeeze(2)
-        uni_probs = (self.uni_counts + 0.1) / (self.total_tokens + 0.1 * self.V)
-        uni_nll = -uni_probs.log()[y_batch]
-        bi_total = self.bi_counts.sum(dim=1, keepdim=True)
-        bi_probs = (self.bi_counts + 0.1) / (bi_total + 0.1 * self.V)
-        bi_nll = -bi_probs.log()[x_batch.reshape(-1), y_batch.reshape(-1)].reshape(bsz, slen)
-        prev2 = torch.zeros_like(x_batch); prev2[:, 1:] = x_batch[:, :-1]
-        ctx_hash = ((prev2 * 36313) ^ (x_batch * 27191)) % self.TRI_HASH
-        tri_count = self.tri_counts[ctx_hash.reshape(-1).long(), y_batch.reshape(-1).long()]
-        tri_total = self.tri_row_totals[ctx_hash.reshape(-1).long()].clamp(min=1)
-        tri_nll = -(((tri_count + 0.01) / (tri_total + 0.01 * self.V)).log()).reshape(bsz, slen)
-        entropy_nll = -(neural_lp.exp() * neural_lp).sum(-1)
-        expert_nll = torch.stack([neural_nll, uni_nll, bi_nll, tri_nll, entropy_nll], dim=-1)
-        log_w = self.log_weights - self.log_weights.logsumexp(0)
-        mixed_lp = (-expert_nll + log_w.unsqueeze(0).unsqueeze(0)).logsumexp(dim=-1)
-        return -mixed_lp, expert_nll
+    def _hash_full(self, tokens, next_tok, order):
+        """Hash context + next_token."""
+        h = np.uint64(0)
+        for i, t in enumerate(tokens[-(order-1):]):
+            h = (h ^ (np.uint64(t) * self.primes[i])) & self.mask
+        h = (h ^ (np.uint64(next_tok) * self.primes[order-1])) & self.mask
+        return int(h)
 
-    def update_weights(self, expert_nll, wlens):
-        if expert_nll is None: return
-        with torch.no_grad():
-            bsz, slen = expert_nll.shape[0], expert_nll.shape[1]
-            wlens_t = torch.tensor(wlens, device=self.device, dtype=torch.long)
-            mask = torch.arange(slen, device=self.device).unsqueeze(0) < wlens_t.unsqueeze(1)
-            masked_nll = expert_nll * mask.unsqueeze(-1).float()
-            expert_mean_loss = masked_nll.sum(dim=(0, 1)) / mask.sum().clamp(min=1)
-            self.log_weights -= self.eta * expert_mean_loss
+    def update_counts(self, token_stream_np):
+        """Update all order tables from a scored token stream (numpy array)."""
+        n = len(token_stream_np)
+        for oi, order in enumerate(range(self.min_order, self.max_order + 1)):
+            if n < order:
+                continue
+            for pos in range(order - 1, n):
+                ctx = token_stream_np[pos - order + 1:pos]
+                nxt = token_stream_np[pos]
+                ctx_h = self._hash_context(ctx, order)
+                full_h = self._hash_full(ctx, nxt, order)
+                self.ctx_tables[oi][ctx_h] += 1
+                self.full_tables[oi][full_h] += 1
+
+    def get_ngram_log_prob(self, context_np, next_tok):
+        """Multi-order backoff: try highest order first, cascade down on miss."""
+        n_ctx = len(context_np)
+        for oi in range(self.n_orders - 1, -1, -1):
+            order = self.min_order + oi
+            if n_ctx < order - 1:
+                continue
+            ctx = context_np[-(order-1):]
+            ctx_h = self._hash_context(ctx, order)
+            ctx_count = self.ctx_tables[oi][ctx_h]
+            if ctx_count < self.min_count:
+                continue
+            full_h = self._hash_full(ctx, next_tok, order)
+            full_count = self.full_tables[oi][full_h]
+            prob = (full_count + 0.1) / (ctx_count + 0.1 * self.V)
+            return math.log(max(prob, 1e-10))
+        # Fallback: uniform
+        return -math.log(self.V)
+
+    def entropy_alpha(self, entropy):
+        """Entropy-adaptive mixing weight."""
+        return self.ent_base + self.ent_range / (1.0 + math.exp(-self.ent_scale * (entropy - self.ent_thresh)))
 
 
 class Hyperparameters:
@@ -1523,10 +1536,15 @@ def main() -> None:
         total_steps = args.ttt_epochs * ((my_end - my_start + batch_seqs - 1) // batch_seqs)
         ttt_sched = torch.optim.lr_scheduler.CosineAnnealingLR(ttt_opt, T_max=max(total_steps, 1))
 
-        # Hedge Mixer: 5-expert online context mixing (from PR #688)
-        use_mixer = os.environ.get("USE_MIXER", "1") == "1"
-        mixer = LogisticContextMixer(vocab_size=args.vocab_size, device=device,
-                                      eta=float(os.environ.get("MIXER_ETA", "0.1"))) if use_mixer else None
+        # N-gram Backoff Cache (from PR #727 — worth ~0.16 BPB)
+        use_ngram = os.environ.get("NGRAM_CACHE", "1") == "1"
+        ngram_cache = NgramBackoffCache(
+            vocab_size=args.vocab_size,
+            max_order=int(os.environ.get("NGRAM_ORDER", "7")),
+            min_order=int(os.environ.get("NGRAM_MIN_ORDER", "2")),
+            buckets=int(os.environ.get("NGRAM_BUCKETS", "4194304")),
+            min_count=int(os.environ.get("NGRAM_MIN_COUNT", "2")),
+        ) if use_ngram else None
 
         # Accumulators for BPB (last epoch only)
         ttt_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1547,12 +1565,31 @@ def main() -> None:
                     base_model.eval()
                     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits = base_model.forward_logits(xb)
-                    # Hedge Mixer: blend 5 experts or use neural-only
-                    if mixer is not None:
-                        wlens = [seq_len] * xb.size(0)
-                        mixed_nll, expert_nll = mixer.mix_and_score(logits.float(), xb, yb, wlens)
+                    # N-gram Backoff: blend neural logits with multi-order n-gram cache
+                    if ngram_cache is not None:
+                        neural_lp = F.log_softmax(logits.float(), dim=-1)  # [bsz, slen, V]
+                        neural_nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(),
+                                                     yb.reshape(-1), reduction="none").reshape(xb.size(0), seq_len)
+                        # Per-position entropy for adaptive alpha
+                        entropy = -(neural_lp.exp() * neural_lp).sum(-1)  # [bsz, slen]
+                        # Get n-gram log probs for each position
+                        xb_np = xb.cpu().numpy()
+                        yb_np = yb.cpu().numpy()
+                        ngram_lp = torch.zeros_like(neural_nll)
+                        for b in range(xb.size(0)):
+                            for t in range(seq_len):
+                                ctx_start = max(0, t - 6)  # up to 7 tokens of context
+                                ctx = xb_np[b, ctx_start:t+1]
+                                ng_lp = ngram_cache.get_ngram_log_prob(ctx, int(yb_np[b, t]))
+                                ngram_lp[b, t] = -ng_lp  # NLL
+                        # Entropy-adaptive alpha: high entropy -> trust n-gram more
+                        alpha = torch.zeros_like(entropy)
+                        for b in range(xb.size(0)):
+                            for t in range(seq_len):
+                                alpha[b, t] = ngram_cache.entropy_alpha(entropy[b, t].item())
+                        # Mix: (1-alpha)*neural + alpha*ngram in log space
+                        mixed_nll = (1 - alpha) * neural_nll + alpha * ngram_lp
                         nll = mixed_nll.reshape(-1)
-                        mixer.update_weights(expert_nll, wlens)
                     else:
                         nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(),
                                               yb.reshape(-1), reduction="none")
@@ -1564,9 +1601,11 @@ def main() -> None:
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     ttt_byte_count += tb.sum()
 
-                # Update mixer statistics from scored chunk
-                if mixer is not None:
-                    mixer.update(yb.reshape(-1))
+                # Update n-gram cache from scored chunk
+                if ngram_cache is not None:
+                    # Build full token stream for this chunk (context + targets)
+                    chunk_tokens = torch.cat([xb[:1, :1], yb.reshape(-1)]).cpu().numpy()
+                    ngram_cache.update_counts(chunk_tokens)
 
                 # 2. Train on the scored chunk
                 base_model.train()
