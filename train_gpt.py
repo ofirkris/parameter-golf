@@ -37,6 +37,76 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 
+# -----------------------------
+# HEDGE MIXER (from PR #688 — 5-expert online context mixing)
+# -----------------------------
+
+class LogisticContextMixer:
+    def __init__(self, vocab_size: int = 1024, device: str = 'cuda', eta: float = 0.1):
+        self.V = vocab_size
+        self.device = device
+        self.eta = eta
+        self.K = 5
+        self.log_weights = torch.zeros(self.K, device=device)
+        self.log_weights[0] = 2.0  # bias toward neural
+        self.uni_counts = torch.zeros(vocab_size, device=device)
+        self.bi_counts = torch.zeros(vocab_size, vocab_size, device=device)
+        self.total_tokens = 0
+        self.TRI_HASH = 65536
+        self.tri_counts = torch.zeros(self.TRI_HASH, vocab_size, device=device)
+        self.tri_row_totals = torch.zeros(self.TRI_HASH, device=device)
+
+    def update(self, tokens):
+        t = tokens.to(self.device).long() if hasattr(tokens, 'cpu') else torch.tensor(tokens, device=self.device, dtype=torch.long)
+        n = t.numel()
+        if n == 0: return
+        self.total_tokens += n
+        self.uni_counts.scatter_add_(0, t, torch.ones(n, device=self.device))
+        if n >= 2:
+            bi_idx = t[:-1] * self.V + t[1:]
+            self.bi_counts.reshape(-1).scatter_add_(0, bi_idx, torch.ones(n - 1, device=self.device))
+        if n >= 3:
+            tri_ctx = ((t[:-2] * 36313) ^ (t[1:-1] * 27191)) % self.TRI_HASH
+            tri_idx = tri_ctx * self.V + t[2:]
+            ones_tri = torch.ones(n - 2, device=self.device)
+            self.tri_counts.reshape(-1).scatter_add_(0, tri_idx, ones_tri)
+            self.tri_row_totals.scatter_add_(0, tri_ctx, ones_tri)
+
+    def mix_and_score(self, neural_logits, x_batch, y_batch, wlens):
+        bsz, slen, V = neural_logits.shape
+        uniform_nll = math.log(self.V)
+        if self.total_tokens < 10000:
+            nll = F.cross_entropy(neural_logits.reshape(-1, V), y_batch.reshape(-1), reduction="none").reshape(bsz, slen)
+            return nll, None
+        neural_lp = F.log_softmax(neural_logits, dim=-1)
+        neural_nll = -neural_lp.gather(2, y_batch.unsqueeze(2)).squeeze(2)
+        uni_probs = (self.uni_counts + 0.1) / (self.total_tokens + 0.1 * self.V)
+        uni_nll = -uni_probs.log()[y_batch]
+        bi_total = self.bi_counts.sum(dim=1, keepdim=True)
+        bi_probs = (self.bi_counts + 0.1) / (bi_total + 0.1 * self.V)
+        bi_nll = -bi_probs.log()[x_batch.reshape(-1), y_batch.reshape(-1)].reshape(bsz, slen)
+        prev2 = torch.zeros_like(x_batch); prev2[:, 1:] = x_batch[:, :-1]
+        ctx_hash = ((prev2 * 36313) ^ (x_batch * 27191)) % self.TRI_HASH
+        tri_count = self.tri_counts[ctx_hash.reshape(-1).long(), y_batch.reshape(-1).long()]
+        tri_total = self.tri_row_totals[ctx_hash.reshape(-1).long()].clamp(min=1)
+        tri_nll = -(((tri_count + 0.01) / (tri_total + 0.01 * self.V)).log()).reshape(bsz, slen)
+        entropy_nll = -(neural_lp.exp() * neural_lp).sum(-1)
+        expert_nll = torch.stack([neural_nll, uni_nll, bi_nll, tri_nll, entropy_nll], dim=-1)
+        log_w = self.log_weights - self.log_weights.logsumexp(0)
+        mixed_lp = (-expert_nll + log_w.unsqueeze(0).unsqueeze(0)).logsumexp(dim=-1)
+        return -mixed_lp, expert_nll
+
+    def update_weights(self, expert_nll, wlens):
+        if expert_nll is None: return
+        with torch.no_grad():
+            bsz, slen = expert_nll.shape[0], expert_nll.shape[1]
+            wlens_t = torch.tensor(wlens, device=self.device, dtype=torch.long)
+            mask = torch.arange(slen, device=self.device).unsqueeze(0) < wlens_t.unsqueeze(1)
+            masked_nll = expert_nll * mask.unsqueeze(-1).float()
+            expert_mean_loss = masked_nll.sum(dim=(0, 1)) / mask.sum().clamp(min=1)
+            self.log_weights -= self.eta * expert_mean_loss
+
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -1446,9 +1516,10 @@ def main() -> None:
         total_steps = args.ttt_epochs * ((my_end - my_start + batch_seqs - 1) // batch_seqs)
         ttt_sched = torch.optim.lr_scheduler.CosineAnnealingLR(ttt_opt, T_max=max(total_steps, 1))
 
-        # N-gram mixer: blend neural logits with unigram counts (zero artifact cost)
-        ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0"))
-        ngram_counts = torch.zeros(args.vocab_size, device=device, dtype=torch.float32)
+        # Hedge Mixer: 5-expert online context mixing (from PR #688)
+        use_mixer = os.environ.get("USE_MIXER", "1") == "1"
+        mixer = LogisticContextMixer(vocab_size=args.vocab_size, device=device,
+                                      eta=float(os.environ.get("MIXER_ETA", "0.1"))) if use_mixer else None
 
         # Accumulators for BPB (last epoch only)
         ttt_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1469,13 +1540,12 @@ def main() -> None:
                     base_model.eval()
                     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits = base_model.forward_logits(xb)
-                    # N-gram mixer: blend neural logprobs with unigram distribution
-                    if ngram_alpha > 0 and ngram_counts.sum() > 0:
-                        ngram_probs = (ngram_counts + 1e-8) / (ngram_counts.sum() + 1e-8 * args.vocab_size)
-                        log_ngram = ngram_probs.log().unsqueeze(0)
-                        log_neural = F.log_softmax(logits.reshape(-1, logits.size(-1)).float(), dim=-1)
-                        mixed = (1 - ngram_alpha) * log_neural + ngram_alpha * log_ngram
-                        nll = F.nll_loss(mixed, yb.reshape(-1), reduction="none")
+                    # Hedge Mixer: blend 5 experts or use neural-only
+                    if mixer is not None:
+                        wlens = [seq_len] * xb.size(0)
+                        mixed_nll, expert_nll = mixer.mix_and_score(logits.float(), xb, yb, wlens)
+                        nll = mixed_nll.reshape(-1)
+                        mixer.update_weights(expert_nll, wlens)
                     else:
                         nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(),
                                               yb.reshape(-1), reduction="none")
@@ -1487,9 +1557,9 @@ def main() -> None:
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     ttt_byte_count += tb.sum()
 
-                # Update n-gram counts from this chunk
-                if ngram_alpha > 0:
-                    ngram_counts.scatter_add_(0, yb.reshape(-1).long(), torch.ones(yb.numel(), device=device))
+                # Update mixer statistics from scored chunk
+                if mixer is not None:
+                    mixer.update(yb.reshape(-1))
 
                 # 2. Train on the scored chunk
                 base_model.train()
