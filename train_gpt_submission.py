@@ -103,7 +103,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "8,9")
     late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
     qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.15))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 30))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
 

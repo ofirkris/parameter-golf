@@ -19,7 +19,7 @@ Pending 8xH100 validation run.
 - Binary search pruning (exact 16MB fit), zstd-22
 
 ## Eval
-- 1 epoch legal sequential score-then-train TTT
+- 30 epoch legal sequential score-then-train TTT
 - AdamW lr=0.0005, cosine LR, per-layer scaling (mlp.proj 3x, mlp.fc 0.5x)
 - Sliding window stride=64 (non-TTT fallback)
 
