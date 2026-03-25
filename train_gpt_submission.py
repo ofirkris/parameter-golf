@@ -1061,6 +1061,13 @@ def main() -> None:
     master_process = rank == 0
 
     torch.backends.cuda.matmul.allow_tf32 = True
+    # Disable CuDNN SDP to avoid CuteDSL/FA4 codepath which crashes torch.compile on 2.11
+    # (CSE bug in cutedsl_kernel.py PEP 604 annotations, pytorch/pytorch#174094)
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_mem_efficient_sdp, enable_math_sdp
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
     enable_cudnn_sdp(False)

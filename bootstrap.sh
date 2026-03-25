@@ -33,10 +33,10 @@ echo "=== Installing system packages ==="
 apt-get update -qq
 apt-get install -y -qq python3-pip python3-venv git screen 2>&1 | tail -3
 
-# ---- PyTorch 2.7 stable (working torch.compile + flash-attn compat) ----
-# NOTE: PyTorch 2.11 has broken torch.compile (CSE bug). Stay on 2.7.
-echo "=== Installing PyTorch 2.7 ==="
-pip3 install --break-system-packages -U torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5 || \
+# ---- PyTorch 2.11 stable (CUDA 13, better inductor; CuDNN SDP disabled in code to avoid CSE bug) ----
+echo "=== Installing PyTorch 2.11 ==="
+pip3 install --break-system-packages -U torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130 2>&1 | tail -5 || \
+pip3 install --break-system-packages -U torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5 || \
 pip3 install --break-system-packages -U torch --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5 || \
 echo "WARN: PyTorch install failed"
 
@@ -44,9 +44,8 @@ echo "WARN: PyTorch install failed"
 echo "=== Installing Python dependencies ==="
 pip3 install --break-system-packages -q -U zstandard sentencepiece huggingface-hub datasets numpy tqdm 2>&1 | tail -3
 
-# ---- Flash Attention (install FA2 for PyTorch 2.7) ----
-echo "=== Installing Flash Attention ==="
-pip3 install --break-system-packages flash-attn --no-build-isolation 2>&1 | tail -5 || echo "FA build failed, using SDPA"
+# ---- Flash Attention (PyTorch 2.11 SDPA handles FA automatically) ----
+echo "=== Flash Attention: using PyTorch 2.11 built-in SDPA ==="
 
 # ---- Training data (skip if already on volume) ----
 echo "=== Training data ==="
